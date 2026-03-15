@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'accounts',
     'shop',
     'messaging',
+    'escrow_app',
 ]
 
 MIDDLEWARE = [
