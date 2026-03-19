@@ -188,7 +188,6 @@ class PublicProductFeedView(APIView):
         page     = int(request.query_params.get('page', 1))
         q        = request.query_params.get('q', '').strip()
 
-        # ✅ Added shop__owner to select_related so seller_id is always available
         qs = Product.objects.select_related(
             'shop', 'shop__owner', 'category'
         ).order_by('-created_at')
@@ -243,7 +242,6 @@ class PublicProductDetailView(APIView):
 
     def get(self, request, slug):
         try:
-            # ✅ Added shop__owner here too
             product = Product.objects.select_related(
                 'shop', 'shop__owner', 'category'
             ).get(slug=slug)
@@ -364,7 +362,6 @@ class PublicShopProductsView(APIView):
             return Response({'detail': 'Shop not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         category = request.query_params.get('category', '').strip().lower()
-        # ✅ Added shop__owner here too
         qs = shop.products.select_related(
             'shop', 'shop__owner', 'category'
         ).order_by('-created_at')
@@ -400,7 +397,6 @@ class FollowingFeedView(APIView):
         if not followed_ids:
             return Response({'results': [], 'has_next': False})
 
-        # ✅ Added shop__owner here too
         qs = Product.objects.filter(
             shop_id__in=followed_ids
         ).select_related('shop', 'shop__owner', 'category').order_by('-created_at')
@@ -420,7 +416,6 @@ class FollowingFeedView(APIView):
         products_map = {
             p.id: p for p in Product.objects.filter(
                 id__in=page_ids
-            # ✅ And in the re-fetch query
             ).select_related('shop', 'shop__owner', 'category')
         }
         products = [products_map[pid] for pid in page_ids if pid in products_map]
@@ -467,25 +462,66 @@ class FollowingCategoryListView(APIView):
 
 
 class FollowingShopsListView(APIView):
+    """
+    GET /api/feed/following/shops/
+    GET /api/feed/following/shops/?as_shop=<id>
+
+    Personal mode  (?as_shop absent): shops followed by request.user personally
+                                       via ShopFollower.
+    Shop mode      (?as_shop=<id>):   shops followed by that shop identity
+                                       via ShopToShopFollower.
+
+    The two sets are completely independent — joining while in personal mode
+    does NOT affect the shop's following list and vice versa.
+    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from .models import ShopFollower
+        from .models import ShopFollower, ShopToShopFollower
 
-        followed = ShopFollower.objects.filter(
-            user=request.user
-        ).select_related('shop').order_by('shop__shop_name')
+        as_shop_id = request.query_params.get('as_shop')
 
-        data = [
-            {
-                'id':            s.shop.id,
-                'shop_name':     s.shop.shop_name,
-                'shop_category': s.shop.shop_category,
-                'avatar':        request.build_absolute_uri(s.shop.avatar.url) if s.shop.avatar else None,
-                'slug':          s.shop.slug,
-            }
-            for s in followed
-        ]
+        if as_shop_id:
+            # ── Shop mode: shops this shop account follows ───────────────────
+            try:
+                viewer_shop = Shop.objects.get(pk=as_shop_id, owner=request.user)
+            except Shop.DoesNotExist:
+                return Response([])
+
+            followed = ShopToShopFollower.objects.filter(
+                follower_shop=viewer_shop
+            ).select_related('following').order_by('following__shop_name')
+
+            data = [
+                {
+                    'id':            s.following.id,
+                    'shop_name':     s.following.shop_name,
+                    'shop_category': s.following.shop_category,
+                    'avatar':        request.build_absolute_uri(s.following.avatar.url)
+                                     if s.following.avatar else None,
+                    'slug':          s.following.slug,
+                }
+                for s in followed
+            ]
+
+        else:
+            # ── Personal mode: shops this user personally follows ────────────
+            followed = ShopFollower.objects.filter(
+                user=request.user
+            ).select_related('shop').order_by('shop__shop_name')
+
+            data = [
+                {
+                    'id':            s.shop.id,
+                    'shop_name':     s.shop.shop_name,
+                    'shop_category': s.shop.shop_category,
+                    'avatar':        request.build_absolute_uri(s.shop.avatar.url)
+                                     if s.shop.avatar else None,
+                    'slug':          s.shop.slug,
+                }
+                for s in followed
+            ]
+
         return Response(data)
 
 
@@ -603,12 +639,14 @@ class ShopReviewHelpfulView(APIView):
             'helpful':       helpful,
             'helpful_count': review.helpful_votes.count(),
         })
+
+
 class ProductReviewListCreateView(APIView):
     """
     GET  /api/products/<slug>/reviews/           — list reviews + stats (public)
     GET  /api/products/<slug>/reviews/?rating=4  — filter by star
     POST /api/products/<slug>/reviews/           — submit review (auth required)
- 
+
     To submit:
       {
         rating:       1–5,
@@ -620,24 +658,24 @@ class ProductReviewListCreateView(APIView):
       }
     """
     from django.db.models import Avg, Count
- 
+
     def get_permissions(self):
         if self.request.method == 'POST':
             return [IsAuthenticated()]
         return [AllowAny()]
- 
+
     def get(self, request, slug):
         try:
             product = Product.objects.get(slug=slug)
         except Product.DoesNotExist:
             return Response({'detail': 'Product not found.'}, status=404)
- 
+
         from .models import ProductReview
         from .serializers import ProductReviewSerializer
         from django.db.models import Avg, Count
- 
+
         filter_rating = request.query_params.get('rating', '').strip()
- 
+
         qs = (
             ProductReview.objects
             .filter(product=product)
@@ -645,17 +683,17 @@ class ProductReviewListCreateView(APIView):
             .prefetch_related('helpful_votes')
             .order_by('-created_at')
         )
- 
+
         if filter_rating.isdigit():
             qs = qs.filter(rating=int(filter_rating))
- 
+
         all_qs    = ProductReview.objects.filter(product=product)
         stats     = all_qs.aggregate(avg=Avg('rating'), total=Count('id'))
         breakdown = {
             str(i): all_qs.filter(rating=i).count()
             for i in range(1, 6)
         }
- 
+
         serializer = ProductReviewSerializer(qs, many=True, context={'request': request})
         return Response({
             'reviews':    serializer.data,
@@ -663,22 +701,21 @@ class ProductReviewListCreateView(APIView):
             'total':      stats['total'],
             'breakdown':  breakdown,
         })
- 
+
     def post(self, request, slug):
         try:
             product = Product.objects.get(slug=slug)
         except Product.DoesNotExist:
             return Response({'detail': 'Product not found.'}, status=404)
- 
+
         from .models import ProductReview
         from .serializers import ProductReviewSerializer
         from escrow_app.models import EscrowTransaction
- 
-        # ── Verify the buyer actually purchased and received this product ──────
+
         tx_id = request.data.get('transaction')
         if not tx_id:
             return Response({'detail': 'transaction is required.'}, status=400)
- 
+
         try:
             tx = EscrowTransaction.objects.get(
                 pk=tx_id,
@@ -691,8 +728,7 @@ class ProductReviewListCreateView(APIView):
                 {'detail': 'No completed purchase found for this product.'},
                 status=400,
             )
- 
-        # ── Resolve shop identity ──────────────────────────────────────────────
+
         reviewer_shop = None
         as_shop_id    = request.data.get('as_shop')
         if as_shop_id:
@@ -700,23 +736,21 @@ class ProductReviewListCreateView(APIView):
                 reviewer_shop = Shop.objects.get(pk=as_shop_id, owner=request.user)
             except Shop.DoesNotExist:
                 return Response({'detail': 'Invalid shop account.'}, status=400)
- 
-        # ── Duplicate check ────────────────────────────────────────────────────
+
         if ProductReview.objects.filter(
             product=product, reviewer=request.user, reviewer_shop=reviewer_shop
         ).exists():
             return Response({'detail': 'You have already reviewed this product.'}, status=400)
- 
-        # ── Validate fields ────────────────────────────────────────────────────
+
         rating  = request.data.get('rating', '')
         title   = request.data.get('title', '').strip()
         comment = request.data.get('comment', '').strip()
- 
+
         if not str(rating).isdigit() or not (1 <= int(rating) <= 5):
             return Response({'detail': 'Rating must be between 1 and 5.'}, status=400)
         if not comment:
             return Response({'detail': 'Comment is required.'}, status=400)
- 
+
         review = ProductReview.objects.create(
             product       = product,
             transaction   = tx,
@@ -726,25 +760,25 @@ class ProductReviewListCreateView(APIView):
             title         = title,
             comment       = comment,
         )
- 
+
         return Response(
             ProductReviewSerializer(review, context={'request': request}).data,
             status=201,
         )
- 
- 
+
+
 class ProductReviewHelpfulView(APIView):
     """POST /api/products/reviews/<pk>/helpful/ — toggle helpful (auth required)"""
     permission_classes = [IsAuthenticated]
- 
+
     def post(self, request, pk):
         from .models import ProductReview, ProductReviewHelpful
- 
+
         try:
             review = ProductReview.objects.get(pk=pk)
         except ProductReview.DoesNotExist:
             return Response({'detail': 'Review not found.'}, status=404)
- 
+
         obj, created = ProductReviewHelpful.objects.get_or_create(
             review=review, user=request.user
         )
@@ -753,8 +787,9 @@ class ProductReviewHelpfulView(APIView):
             helpful = False
         else:
             helpful = True
- 
+
         return Response({
             'helpful':       helpful,
             'helpful_count': review.helpful_votes.count(),
-        })   
+        })
+    

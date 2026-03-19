@@ -298,3 +298,110 @@ class ShipOrderSerializer(serializers.Serializer):
     tracking_number = serializers.CharField()
     delivery_date   = serializers.DateField(required=False, allow_null=True)
     time_window     = serializers.CharField(allow_blank=True, required=False, default='')
+
+
+# ── Issue serializers ──────────────────────────────────────────────────────────
+
+class IssueMessageSerializer(serializers.ModelSerializer):
+    sender_name   = serializers.SerializerMethodField()
+    sender_avatar = serializers.SerializerMethodField()
+
+    class Meta:
+        from .models import IssueMessage
+        model  = IssueMessage
+        fields = ['id', 'sender_role', 'sender_name', 'sender_avatar', 'text', 'created_at']
+        read_only_fields = fields
+
+    def _safe_name(self, user):
+        if not user: return 'Unknown'
+        full = (getattr(user, 'full_name', '') or '').strip()
+        if full: return full
+        first = (user.first_name or '').strip()
+        last  = (user.last_name  or '').strip()
+        joined = ' '.join(p for p in [first, last] if p)
+        if joined: return joined
+        return (user.email or '').split('@')[0].replace('.', ' ').replace('_', ' ').title()
+
+    def get_sender_name(self, obj):
+        if obj.sender_role == 'marketplace': return 'Wireshops Support'
+        return self._safe_name(obj.sender)
+
+    def get_sender_avatar(self, obj):
+        if not obj.sender or obj.sender_role == 'marketplace': return None
+        request = self.context.get('request')
+        try:
+            photo = obj.sender.userprofile.profile_picture
+            if photo:
+                url = photo.url if hasattr(photo, 'url') else str(photo)
+                return request.build_absolute_uri(url) if request else url
+        except Exception: pass
+        # Try shop avatar if buyer/seller had a shop identity on the tx
+        tx = obj.issue.transaction
+        if obj.sender_role == 'buyer' and tx.buyer_shop and tx.buyer_shop.avatar:
+            return request.build_absolute_uri(tx.buyer_shop.avatar.url) if request else tx.buyer_shop.avatar.url
+        if obj.sender_role == 'seller' and tx.seller_shop and tx.seller_shop.avatar:
+            return request.build_absolute_uri(tx.seller_shop.avatar.url) if request else tx.seller_shop.avatar.url
+        return None
+
+
+class IssueSerializer(serializers.ModelSerializer):
+    messages        = IssueMessageSerializer(many=True, read_only=True)
+    transaction_id  = serializers.UUIDField(source='transaction.id', read_only=True)
+    product_title   = serializers.CharField(source='transaction.product_title', read_only=True)
+    product_image   = serializers.SerializerMethodField()
+    seller_name     = serializers.SerializerMethodField()
+    seller_avatar   = serializers.SerializerMethodField()
+    buyer_name      = serializers.SerializerMethodField()
+    buyer_avatar    = serializers.SerializerMethodField()
+
+    class Meta:
+        from .models import Issue
+        model  = Issue
+        fields = [
+            'id', 'stage', 'issue_type', 'created_at', 'updated_at',
+            'transaction_id', 'product_title', 'product_image',
+            'seller_name', 'seller_avatar',
+            'buyer_name',  'buyer_avatar',
+            'messages',
+        ]
+        read_only_fields = fields
+
+    def get_product_image(self, obj):
+        product = obj.transaction.product
+        if not product: return None
+        images = product.images
+        if not images or not isinstance(images, list): return None
+        first = images[0]
+        if not first: return None
+        if str(first).startswith('http'): return str(first)
+        request = self.context.get('request')
+        return request.build_absolute_uri(first) if request else first
+
+    def _abs(self, image_field, request):
+        if not image_field: return None
+        url = image_field.url if hasattr(image_field, 'url') else str(image_field)
+        return request.build_absolute_uri(url) if request else url
+
+    def get_seller_name(self, obj):
+        tx = obj.transaction
+        if tx.seller_shop: return tx.seller_shop.shop_name
+        return _user_display_name(tx.seller)
+
+    def get_seller_avatar(self, obj):
+        tx = obj.transaction
+        request = self.context.get('request')
+        if tx.seller_shop and tx.seller_shop.avatar:
+            return self._abs(tx.seller_shop.avatar, request)
+        return None
+
+    def get_buyer_name(self, obj):
+        tx = obj.transaction
+        if tx.buyer_shop: return tx.buyer_shop.shop_name
+        return _user_display_name(tx.buyer)
+
+    def get_buyer_avatar(self, obj):
+        tx = obj.transaction
+        request = self.context.get('request')
+        if tx.buyer_shop and tx.buyer_shop.avatar:
+            return self._abs(tx.buyer_shop.avatar, request)
+        return None

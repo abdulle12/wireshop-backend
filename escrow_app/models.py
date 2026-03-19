@@ -132,3 +132,70 @@ class Notification(models.Model):
     def __str__(self):
         target = self.recipient_shop or self.recipient_user
         return f"[{self.kind}] → {target}"
+
+
+# ── Issue / Support system ─────────────────────────────────────────────────────
+
+class Issue(models.Model):
+    """
+    A support issue raised by a buyer against a specific transaction.
+
+    Stage flow:
+      open → replied (seller responds) → resolved (either party) or escalated (marketplace)
+
+    When escalated the EscrowTransaction is also marked STATUS_DISPUTED (funds frozen).
+    When resolved the buyer must still confirm receipt separately — or the marketplace
+    can force-resolve to either STATUS_RELEASED or STATUS_REFUNDED.
+    """
+    STAGE_OPEN            = 'open'
+    STAGE_REPLIED         = 'replied'
+    STAGE_SELLER_RESOLVED = 'seller_resolved'  # seller marked resolved, awaiting buyer confirmation
+    STAGE_RESOLVED        = 'resolved'          # buyer confirmed — funds released
+    STAGE_ESCALATED       = 'escalated'         # marketplace decides
+
+    STAGE_CHOICES = [
+        (STAGE_OPEN,            'Open'),
+        (STAGE_REPLIED,         'Replied'),
+        (STAGE_SELLER_RESOLVED, 'Pending Confirmation'),
+        (STAGE_RESOLVED,        'Resolved'),
+        (STAGE_ESCALATED,       'Escalated'),
+    ]
+
+    transaction   = models.OneToOneField(
+        'EscrowTransaction', on_delete=models.CASCADE, related_name='issue'
+    )
+    issue_type    = models.CharField(max_length=255)   # chosen from dropdown
+    stage         = models.CharField(max_length=20, choices=STAGE_CHOICES, default=STAGE_OPEN)
+    created_at    = models.DateTimeField(auto_now_add=True)
+    updated_at    = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Issue #{self.pk} [{self.stage}] — {self.transaction.product_title}"
+
+
+class IssueMessage(models.Model):
+    """A single message in an Issue thread. sender_role is 'buyer' or 'seller'."""
+    ROLE_BUYER  = 'buyer'
+    ROLE_SELLER = 'seller'
+    ROLE_MARKET = 'marketplace'
+
+    ROLE_CHOICES = [
+        (ROLE_BUYER,  'Buyer'),
+        (ROLE_SELLER, 'Seller'),
+        (ROLE_MARKET, 'Marketplace'),
+    ]
+
+    issue       = models.ForeignKey(Issue, on_delete=models.CASCADE, related_name='messages')
+    sender      = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True)
+    sender_role = models.CharField(max_length=15, choices=ROLE_CHOICES)
+    text        = models.TextField()
+    created_at  = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"[{self.sender_role}] {self.text[:60]}"

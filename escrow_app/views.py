@@ -278,7 +278,7 @@ class DisputeOrderView(APIView):
 
     def post(self, request, pk):
         tx = get_object_or_404(EscrowTransaction, pk=pk, buyer=request.user)
-        if tx.status not in (EscrowTransaction.STATUS_SHIPPED, EscrowTransaction.STATUS_DELIVERED):
+        if tx.status not in (EscrowTransaction.STATUS_SHIPPED, EscrowTransaction.STATUS_RELEASED, EscrowTransaction.STATUS_DISPUTED):
             return Response({'detail': 'Cannot dispute in current state.'}, status=400)
 
         tx.status = EscrowTransaction.STATUS_DISPUTED
@@ -465,3 +465,485 @@ class BuyerOrderCountsView(APIView):
             'shipped':  base_qs.filter(status=EscrowTransaction.STATUS_SHIPPED).count(),
             'released': base_qs.filter(status=EscrowTransaction.STATUS_RELEASED).count(),
         })
+
+
+class ProductOrdersView(APIView):
+    """
+    GET /api/escrow/product/<product_id>/orders/?status=held|shipped|released
+
+    Returns all orders for a specific product where the requesting user is
+    the seller. Used by the shop owner to see per-product customer lists.
+
+    Includes seller_payout on each transaction so the paid list can total up.
+    """
+    permission_classes = [IsAuthenticated]
+
+    STATUS_MAP = {
+        'held':     [EscrowTransaction.STATUS_HELD],
+        'shipped':  [EscrowTransaction.STATUS_SHIPPED],
+        'released': [EscrowTransaction.STATUS_RELEASED],
+    }
+
+    def get(self, request, product_id):
+        status_key = request.query_params.get('status', 'held')
+        statuses   = self.STATUS_MAP.get(status_key, [EscrowTransaction.STATUS_HELD])
+
+        qs = EscrowTransaction.objects.filter(
+            seller=request.user,
+            product_id=product_id,
+            status__in=statuses,
+        ).select_related(
+            'buyer', 'buyer_shop'
+        ).order_by('-created_at')
+
+        return Response(EscrowTransactionSerializer(qs, many=True, context={'request': request}).data)
+
+
+class ProductOrderCountsView(APIView):
+    """
+    GET /api/escrow/product/<product_id>/order-counts/
+
+    Returns { held: N, shipped: N, released: N } for a specific product.
+    Used by the shop owner's product cards to show live counts on buttons.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, product_id):
+        base = EscrowTransaction.objects.filter(
+            seller=request.user,
+            product_id=product_id,
+        )
+        return Response({
+            'held':     base.filter(status=EscrowTransaction.STATUS_HELD).count(),
+            'shipped':  base.filter(status=EscrowTransaction.STATUS_SHIPPED).count(),
+            'released': base.filter(status=EscrowTransaction.STATUS_RELEASED).count(),
+        })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ISSUE / SUPPORT SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _issue_buyer_check(issue, request):
+    """Return True if request.user is the buyer on this issue's transaction."""
+    tx = issue.transaction
+    return tx.buyer == request.user
+
+
+def _issue_seller_check(issue, request):
+    """Return True if request.user is the seller on this issue's transaction."""
+    tx = issue.transaction
+    return tx.seller == request.user
+
+
+class ReportIssueView(APIView):
+    """
+    POST /api/escrow/<uuid:pk>/report-issue/
+
+    Buyer creates an Issue + first message against a SHIPPED or RELEASED transaction.
+    Creates Issue with stage='open', freezes funds (STATUS_DISPUTED),
+    and notifies the seller.
+
+    Body: { issue_type, message, as_shop? }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from .models import EscrowTransaction, Issue, IssueMessage, Notification
+
+        try:
+            tx = EscrowTransaction.objects.get(pk=pk, buyer=request.user)
+        except EscrowTransaction.DoesNotExist:
+            return Response({'detail': 'Transaction not found.'}, status=404)
+
+        allowed = [EscrowTransaction.STATUS_SHIPPED, EscrowTransaction.STATUS_RELEASED]
+        if tx.status not in allowed:
+            return Response({'detail': 'Can only report an issue on shipped or released orders.'}, status=400)
+
+        if hasattr(tx, 'issue'):
+            return Response({'detail': 'An issue has already been reported for this order.'}, status=400)
+
+        issue_type = request.data.get('issue_type', '').strip()
+        message    = request.data.get('message', '').strip()
+
+        if not issue_type:
+            return Response({'detail': 'issue_type is required.'}, status=400)
+        if not message:
+            return Response({'detail': 'message is required.'}, status=400)
+
+        # Freeze funds
+        tx.status = EscrowTransaction.STATUS_DISPUTED
+        tx.save(update_fields=['status'])
+
+        issue = Issue.objects.create(
+            transaction=tx,
+            issue_type=issue_type,
+            stage=Issue.STAGE_OPEN,
+        )
+
+        IssueMessage.objects.create(
+            issue=issue,
+            sender=request.user,
+            sender_role=IssueMessage.ROLE_BUYER,
+            text=message,
+        )
+
+        # Notify seller
+        buyer_lbl = tx.buyer_shop.shop_name if tx.buyer_shop else _safe_name(tx.buyer)
+        notif_data = {
+            'transaction': tx,
+            'kind':        Notification.KIND_DISPUTE_OPENED,
+            'title':       f'Issue reported: {tx.product_title}',
+            'message':     f'{buyer_lbl} reported an issue: "{issue_type}". Funds are frozen pending resolution.',
+        }
+        if tx.seller_shop:
+            Notification.objects.create(recipient_shop=tx.seller_shop,  **notif_data)
+        else:
+            Notification.objects.create(recipient_user=tx.seller, **notif_data)
+
+        from .serializers import IssueSerializer
+        return Response(IssueSerializer(issue, context={'request': request}).data, status=201)
+
+
+class BuyerIssueListView(APIView):
+    """
+    GET /api/escrow/my-issues/
+    GET /api/escrow/my-issues/?as_shop=<id>
+
+    Personal mode (no ?as_shop): issues on transactions where buyer_shop is null.
+    Shop mode    (?as_shop=<id>): issues on transactions where buyer_shop matches.
+    The two sets are completely separate — switching identity shows only that
+    identity's issues.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Issue
+        from .serializers import IssueSerializer
+
+        as_shop_id = request.query_params.get('as_shop')
+
+        qs = Issue.objects.filter(transaction__buyer=request.user)
+
+        if as_shop_id:
+            # Shop identity — only issues from purchases made as this shop
+            qs = qs.filter(transaction__buyer_shop__id=as_shop_id)
+        else:
+            # Personal identity — only issues from personal purchases
+            qs = qs.filter(transaction__buyer_shop__isnull=True)
+
+        qs = qs.select_related(
+            'transaction', 'transaction__buyer_shop',
+            'transaction__seller_shop', 'transaction__seller',
+            'transaction__product',
+        ).prefetch_related('messages__sender')
+
+        return Response(IssueSerializer(qs, many=True, context={'request': request}).data)
+
+
+class IssueCountView(APIView):
+    """
+    GET /api/escrow/my-issue-count/
+    GET /api/escrow/my-issue-count/?as_shop=<id>
+
+    Returns { count } of open/replied issues for this buyer identity.
+    Personal mode: buyer_shop is null. Shop mode: filters by buyer_shop.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Issue
+        as_shop_id = request.query_params.get('as_shop')
+
+        # Include all active stages — seller_resolved needs buyer action too
+        qs = Issue.objects.filter(
+            transaction__buyer=request.user,
+            stage__in=[Issue.STAGE_OPEN, Issue.STAGE_REPLIED, Issue.STAGE_SELLER_RESOLVED],
+        )
+        if as_shop_id:
+            qs = qs.filter(transaction__buyer_shop__id=as_shop_id)
+        else:
+            qs = qs.filter(transaction__buyer_shop__isnull=True)
+
+        return Response({'count': qs.count()})
+
+
+class SellerIssueListView(APIView):
+    """
+    GET /api/escrow/seller-issues/
+    GET /api/escrow/seller-issues/?as_shop=<id>
+
+    Returns all issues on the seller's transactions.
+    If ?as_shop=<id> — only issues on transactions where seller_shop matches.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Issue
+        from .serializers import IssueSerializer
+
+        as_shop_id = request.query_params.get('as_shop')
+
+        if as_shop_id:
+            issues = Issue.objects.filter(
+                transaction__seller=request.user,
+                transaction__seller_shop__id=as_shop_id,
+            )
+        else:
+            # Personal identity — only issues on personal sales (seller_shop is null)
+            issues = Issue.objects.filter(
+                transaction__seller=request.user,
+                transaction__seller_shop__isnull=True,
+            )
+
+        issues = issues.select_related(
+            'transaction', 'transaction__buyer_shop',
+            'transaction__seller_shop', 'transaction__buyer',
+            'transaction__product',
+        ).prefetch_related('messages__sender')
+
+        return Response(IssueSerializer(issues, many=True, context={'request': request}).data)
+
+
+class IssueDetailView(APIView):
+    """
+    GET  /api/escrow/issues/<pk>/   — buyer or seller fetches full detail + messages
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from .models import Issue
+        from .serializers import IssueSerializer
+
+        try:
+            issue = Issue.objects.select_related(
+                'transaction', 'transaction__buyer_shop',
+                'transaction__seller_shop', 'transaction__seller',
+                'transaction__buyer', 'transaction__product',
+            ).prefetch_related('messages__sender').get(pk=pk)
+        except Issue.DoesNotExist:
+            return Response({'detail': 'Issue not found.'}, status=404)
+
+        tx = issue.transaction
+        if tx.buyer != request.user and tx.seller != request.user:
+            return Response({'detail': 'Not authorised.'}, status=403)
+
+        return Response(IssueSerializer(issue, context={'request': request}).data)
+
+
+class IssueMessageView(APIView):
+    """
+    POST /api/escrow/issues/<pk>/message/
+
+    Buyer or seller adds a message to the thread.
+    Seller reply advances stage → 'replied'.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        from .models import Issue, IssueMessage, Notification
+        from .serializers import IssueMessageSerializer
+
+        try:
+            issue = Issue.objects.select_related(
+                'transaction', 'transaction__buyer',
+                'transaction__seller', 'transaction__buyer_shop',
+                'transaction__seller_shop',
+            ).get(pk=pk)
+        except Issue.DoesNotExist:
+            return Response({'detail': 'Issue not found.'}, status=404)
+
+        tx = issue.transaction
+        is_buyer  = tx.buyer  == request.user
+        is_seller = tx.seller == request.user
+
+        if not is_buyer and not is_seller:
+            return Response({'detail': 'Not authorised.'}, status=403)
+
+        if issue.stage in [Issue.STAGE_RESOLVED, Issue.STAGE_ESCALATED]:
+            return Response({'detail': 'This issue is closed.'}, status=400)
+
+        text = request.data.get('text', '').strip()
+        if not text:
+            return Response({'detail': 'text is required.'}, status=400)
+
+        role = IssueMessage.ROLE_BUYER if is_buyer else IssueMessage.ROLE_SELLER
+
+        msg = IssueMessage.objects.create(
+            issue=issue,
+            sender=request.user,
+            sender_role=role,
+            text=text,
+        )
+
+        # Seller reply moves stage to 'replied'
+        if is_seller and issue.stage == Issue.STAGE_OPEN:
+            issue.stage = Issue.STAGE_REPLIED
+            issue.save(update_fields=['stage'])
+
+        # Notify the other party
+        if is_seller:
+            notif_kwargs = {'transaction': tx, 'kind': 'issue_replied',
+                'title': f'Seller replied on: {tx.product_title}',
+                'message': text[:120]}
+            if tx.buyer_shop:
+                Notification.objects.create(recipient_shop=tx.buyer_shop,  **notif_kwargs)
+            else:
+                Notification.objects.create(recipient_user=tx.buyer, **notif_kwargs)
+        else:
+            notif_kwargs = {'transaction': tx, 'kind': 'issue_replied',
+                'title': f'Buyer replied on: {tx.product_title}',
+                'message': text[:120]}
+            if tx.seller_shop:
+                Notification.objects.create(recipient_shop=tx.seller_shop, **notif_kwargs)
+            else:
+                Notification.objects.create(recipient_user=tx.seller, **notif_kwargs)
+
+        return Response(IssueMessageSerializer(msg, context={'request': request}).data, status=201)
+
+
+class IssueResolveView(APIView):
+    """
+    PATCH /api/escrow/issues/<pk>/resolve/
+
+    SELLER → stage: seller_resolved  (funds still frozen, buyer notified to confirm)
+    BUYER  → stage: resolved, tx: STATUS_RELEASED, buy_count++, funds released
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        from .models import Issue, Notification
+        from .serializers import IssueSerializer
+
+        try:
+            issue = Issue.objects.select_related(
+                'transaction', 'transaction__buyer', 'transaction__seller',
+                'transaction__buyer_shop', 'transaction__seller_shop',
+                'transaction__product',
+            ).get(pk=pk)
+        except Issue.DoesNotExist:
+            return Response({'detail': 'Issue not found.'}, status=404)
+
+        tx        = issue.transaction
+        is_buyer  = tx.buyer  == request.user
+        is_seller = tx.seller == request.user
+
+        if not is_buyer and not is_seller:
+            return Response({'detail': 'Not authorised.'}, status=403)
+        if issue.stage == Issue.STAGE_ESCALATED:
+            return Response({'detail': 'Escalated issues are handled by the marketplace.'}, status=400)
+        if issue.stage == Issue.STAGE_RESOLVED:
+            return Response({'detail': 'Already resolved.'}, status=400)
+
+        # ── SELLER marks resolved ─────────────────────────────────────────────
+        # Funds stay frozen. Buyer must confirm before funds are released.
+        if is_seller:
+            issue.stage = Issue.STAGE_SELLER_RESOLVED
+            issue.save(update_fields=['stage'])
+
+            seller_lbl = tx.seller_shop.shop_name if tx.seller_shop else _safe_name(tx.seller)
+            notif = {
+                'transaction': tx,
+                'kind':        'issue_replied',
+                'title':       f'{seller_lbl} marked the issue as resolved',
+                'message':     f'Please confirm if the issue with "{tx.product_title}" is resolved, or escalate to the marketplace.',
+            }
+            if tx.buyer_shop:
+                Notification.objects.create(recipient_shop=tx.buyer_shop, **notif)
+            else:
+                Notification.objects.create(recipient_user=tx.buyer, **notif)
+
+            return Response(IssueSerializer(issue, context={'request': request}).data)
+
+        # ── BUYER confirms resolution ─────────────────────────────────────────
+        # Only allowed when seller has marked resolved (or stage is replied).
+        if issue.stage not in (Issue.STAGE_SELLER_RESOLVED, Issue.STAGE_REPLIED, Issue.STAGE_OPEN):
+            return Response({'detail': 'Nothing to confirm yet.'}, status=400)
+
+        issue.stage = Issue.STAGE_RESOLVED
+        issue.save(update_fields=['stage'])
+
+        # Release escrow
+        funds_released = False
+        if tx.status == EscrowTransaction.STATUS_DISPUTED:
+            tx.status = EscrowTransaction.STATUS_RELEASED
+            tx.save(update_fields=['status'])
+            funds_released = True
+            if tx.product_id:
+                Product.objects.filter(pk=tx.product_id).update(
+                    buy_count=models.F('buy_count') + 1
+                )
+
+        buyer_lbl = _buyer_label(tx)
+        notif = {
+            'transaction': tx,
+            'kind':        Notification.KIND_RECEIPT_CONFIRMED,
+            'title':       f'Issue resolved — funds released',
+            'message':     f'{buyer_lbl} confirmed the issue is resolved for "{tx.product_title}". KES {tx.seller_payout} released.',
+        }
+        if tx.seller_shop:
+            Notification.objects.create(recipient_shop=tx.seller_shop, **notif)
+        else:
+            Notification.objects.create(recipient_user=tx.seller, **notif)
+
+        return Response({
+            **IssueSerializer(issue, context={'request': request}).data,
+            'funds_released': funds_released,
+            'seller_payout':  str(tx.seller_payout),
+            'platform_cut':   str(tx.platform_fee),
+        })
+
+
+class IssueEscalateView(APIView):
+    """
+    PATCH /api/escrow/issues/<pk>/escalate/
+
+    Buyer escalates to marketplace after seller reply didn't satisfy.
+    Stage → 'escalated'. Transaction stays STATUS_DISPUTED (funds frozen).
+    Marketplace admins will review via Django admin or a future admin dashboard.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, pk):
+        from .models import Issue, IssueMessage, Notification
+        from .serializers import IssueSerializer
+
+        try:
+            issue = Issue.objects.select_related('transaction').get(pk=pk)
+        except Issue.DoesNotExist:
+            return Response({'detail': 'Issue not found.'}, status=404)
+
+        tx = issue.transaction
+        if tx.buyer != request.user:
+            return Response({'detail': 'Only the buyer can escalate an issue.'}, status=403)
+
+        if issue.stage == Issue.STAGE_ESCALATED:
+            return Response({'detail': 'Already escalated.'}, status=400)
+
+        if issue.stage == Issue.STAGE_RESOLVED:
+            return Response({'detail': 'Cannot escalate a resolved issue.'}, status=400)
+
+        issue.stage = Issue.STAGE_ESCALATED
+        issue.save(update_fields=['stage'])
+
+        # System message in thread
+        IssueMessage.objects.create(
+            issue=issue,
+            sender=request.user,
+            sender_role=IssueMessage.ROLE_MARKET,
+            text='This issue has been escalated to Wireshops Marketplace Support. '
+                 'Our team will review and contact both parties within 24 hours. '
+                 'Funds remain frozen until a resolution is reached.',
+        )
+
+        # Notify seller
+        buyer_lbl = tx.buyer_shop.shop_name if tx.buyer_shop else _safe_name(tx.buyer)
+        notif_kwargs = {'transaction': tx, 'kind': Notification.KIND_DISPUTE_OPENED,
+            'title': f'Issue escalated: {tx.product_title}',
+            'message': f'{buyer_lbl} has escalated this issue to the marketplace. Funds remain frozen.'}
+        if tx.seller_shop:
+            Notification.objects.create(recipient_shop=tx.seller_shop, **notif_kwargs)
+        else:
+            Notification.objects.create(recipient_user=tx.seller, **notif_kwargs)
+
+        return Response(IssueSerializer(issue, context={'request': request}).data)
