@@ -136,6 +136,8 @@ class NotificationSerializer(serializers.ModelSerializer):
     avatar         = serializers.SerializerMethodField()
     actor_name     = serializers.SerializerMethodField()
     actor_initials = serializers.SerializerMethodField()
+    recipient_role = serializers.SerializerMethodField()
+    issue_id       = serializers.SerializerMethodField()
     # Rich row extras — sent to frontend for Facebook-style rendering
     product_title  = serializers.CharField(source='transaction.product_title', read_only=True)
     product_image  = serializers.SerializerMethodField()
@@ -148,6 +150,8 @@ class NotificationSerializer(serializers.ModelSerializer):
             'transaction',
             'avatar', 'actor_name', 'actor_initials',
             'product_title', 'product_image',
+            'recipient_role',   # 'buyer' | 'seller' — for frontend routing
+            'issue_id',         # issue PK if this notification is about an issue thread
         ]
         read_only_fields = fields
 
@@ -192,20 +196,43 @@ class NotificationSerializer(serializers.ModelSerializer):
     def _actor_user_and_shop(self, obj):
         """
         Returns (user, shop_or_None) for whoever triggered this notification.
-        Buyer-triggered: order_placed, receipt_confirmed, dispute_opened
-        Seller-triggered: shipped
-        System: funds_released, refunded
+
+        Buyer-triggered (actor = buyer):
+            order_placed, receipt_confirmed, dispute_opened,
+            issue_reported, issue_escalated, issue_resolved (buyer confirmed)
+
+        Seller-triggered (actor = seller):
+            shipped, issue_replied
+
+        System (no actor):
+            funds_released, refunded
         """
         tx = obj.transaction
-        if obj.kind in (
+        buyer_kinds = (
             Notification.KIND_ORDER_PLACED,
             Notification.KIND_RECEIPT_CONFIRMED,
             Notification.KIND_DISPUTE_OPENED,
-        ):
+            Notification.KIND_ISSUE_REPORTED,      # buyer reported → seller sees buyer name
+            Notification.KIND_ISSUE_ESCALATED,     # buyer escalated → both see buyer name
+            Notification.KIND_ISSUE_RESOLVED,      # buyer confirmed → seller sees buyer name
+            Notification.KIND_ISSUE_BUYER_REPLIED, # buyer replied back → seller sees buyer name
+        )
+        seller_kinds = (
+            Notification.KIND_SHIPPED,
+            Notification.KIND_ISSUE_REPLIED,       # seller replied → buyer sees seller name
+        )
+        # Marketplace decisions: no user actor — show as system ("Wireshops")
+        marketplace_kinds = (
+            Notification.KIND_MARKETPLACE_RELEASE,
+            Notification.KIND_MARKETPLACE_REFUND,
+        )
+        if obj.kind in buyer_kinds:
             return tx.buyer, tx.buyer_shop
-        if obj.kind == Notification.KIND_SHIPPED:
+        if obj.kind in seller_kinds:
             return tx.seller, tx.seller_shop
-        return None, None  # system
+        if obj.kind in marketplace_kinds:
+            return None, None  # renders as "Wireshops Escrow" system notification
+        return None, None  # system notification
 
     # ── serializer methods ─────────────────────────────────────────────────────
 
@@ -254,6 +281,58 @@ class NotificationSerializer(serializers.ModelSerializer):
 
         # No photo — return None so frontend renders initials circle
         return None
+
+
+    def get_issue_id(self, obj):
+        """Returns the Issue PK if the transaction has an associated issue, else None."""
+        try:
+            return obj.transaction.issue.pk
+        except Exception:
+            return None
+
+    def get_recipient_role(self, obj):
+        """
+        Returns 'buyer' or 'seller' based on who the notification was sent to.
+        Used by the frontend to route notification clicks correctly:
+          buyer  → /item_issues
+          seller → /support
+
+        Marketplace kinds (release/refund/escalated) go to BOTH parties so we
+        must check the actual recipient fields, not just the kind.
+        Unambiguous kinds (only ever sent to one party) short-circuit early.
+        """
+        tx = obj.transaction
+
+        # Always-seller kinds (only ever sent to seller)
+        always_seller = (
+            Notification.KIND_ORDER_PLACED,
+            Notification.KIND_RECEIPT_CONFIRMED,
+            Notification.KIND_FUNDS_RELEASED,
+            Notification.KIND_ISSUE_REPORTED,
+            Notification.KIND_ISSUE_BUYER_REPLIED,
+        )
+        # Always-buyer kinds (only ever sent to buyer)
+        always_buyer = (
+            Notification.KIND_SHIPPED,
+            Notification.KIND_ISSUE_REPLIED,
+            Notification.KIND_REFUNDED,
+        )
+        if obj.kind in always_seller:
+            return 'seller'
+        if obj.kind in always_buyer:
+            return 'buyer'
+
+        # For all other kinds (issue_resolved, escalated, marketplace_release,
+        # marketplace_refund, dispute_opened) — check actual recipient
+        if obj.recipient_shop:
+            if tx.seller_shop and obj.recipient_shop == tx.seller_shop:
+                return 'seller'
+            return 'buyer'
+        if obj.recipient_user:
+            if obj.recipient_user == tx.seller:
+                return 'seller'
+            return 'buyer'
+        return 'buyer'
 
 
 # ── Request-body serializers ───────────────────────────────────────────────────
@@ -323,30 +402,58 @@ class IssueMessageSerializer(serializers.ModelSerializer):
         return (user.email or '').split('@')[0].replace('.', ' ').replace('_', ' ').title()
 
     def get_sender_name(self, obj):
-        if obj.sender_role == 'marketplace': return 'Wireshops Support'
+        """
+        Priority:
+          marketplace → 'Wireshops Support'
+          buyer       → buyer_shop.shop_name if the purchase was made as a shop,
+                        else user display name
+          seller      → seller_shop.shop_name if the sale was made as a shop,
+                        else user display name
+        """
+        if obj.sender_role == 'marketplace':
+            return 'Wireshops Support'
+        tx = obj.issue.transaction
+        if obj.sender_role == 'buyer' and tx.buyer_shop:
+            return tx.buyer_shop.shop_name
+        if obj.sender_role == 'seller' and tx.seller_shop:
+            return tx.seller_shop.shop_name
         return self._safe_name(obj.sender)
 
     def get_sender_avatar(self, obj):
-        if not obj.sender or obj.sender_role == 'marketplace': return None
+        """
+        Priority:
+          marketplace → None (renders shield icon)
+          buyer       → buyer_shop.avatar if purchased as shop, else user photo
+          seller      → seller_shop.avatar if sold as shop, else user photo
+        """
+        if not obj.sender or obj.sender_role == 'marketplace':
+            return None
         request = self.context.get('request')
+        tx = obj.issue.transaction
+
+        # Shop avatar takes priority — matches what the other party sees on the tx
+        if obj.sender_role == 'buyer' and tx.buyer_shop and tx.buyer_shop.avatar:
+            url = tx.buyer_shop.avatar.url if hasattr(tx.buyer_shop.avatar, 'url') else str(tx.buyer_shop.avatar)
+            return request.build_absolute_uri(url) if request else url
+        if obj.sender_role == 'seller' and tx.seller_shop and tx.seller_shop.avatar:
+            url = tx.seller_shop.avatar.url if hasattr(tx.seller_shop.avatar, 'url') else str(tx.seller_shop.avatar)
+            return request.build_absolute_uri(url) if request else url
+
+        # Fallback to user profile photo
         try:
             photo = obj.sender.userprofile.profile_picture
             if photo:
                 url = photo.url if hasattr(photo, 'url') else str(photo)
                 return request.build_absolute_uri(url) if request else url
-        except Exception: pass
-        # Try shop avatar if buyer/seller had a shop identity on the tx
-        tx = obj.issue.transaction
-        if obj.sender_role == 'buyer' and tx.buyer_shop and tx.buyer_shop.avatar:
-            return request.build_absolute_uri(tx.buyer_shop.avatar.url) if request else tx.buyer_shop.avatar.url
-        if obj.sender_role == 'seller' and tx.seller_shop and tx.seller_shop.avatar:
-            return request.build_absolute_uri(tx.seller_shop.avatar.url) if request else tx.seller_shop.avatar.url
+        except Exception:
+            pass
         return None
 
 
 class IssueSerializer(serializers.ModelSerializer):
     messages        = IssueMessageSerializer(many=True, read_only=True)
     transaction_id  = serializers.UUIDField(source='transaction.id', read_only=True)
+    tx_status       = serializers.CharField(source='transaction.status', read_only=True)
     product_title   = serializers.CharField(source='transaction.product_title', read_only=True)
     product_image   = serializers.SerializerMethodField()
     seller_name     = serializers.SerializerMethodField()
@@ -362,6 +469,7 @@ class IssueSerializer(serializers.ModelSerializer):
             'transaction_id', 'product_title', 'product_image',
             'seller_name', 'seller_avatar',
             'buyer_name',  'buyer_avatar',
+            'tx_status',   # transaction status — lets frontend know release vs refund
             'messages',
         ]
         read_only_fields = fields

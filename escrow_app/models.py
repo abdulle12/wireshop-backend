@@ -98,14 +98,29 @@ class Notification(models.Model):
     KIND_FUNDS_RELEASED    = 'funds_released'
     KIND_DISPUTE_OPENED    = 'dispute_opened'
     KIND_REFUNDED          = 'refunded'
+    # ── Issue / dispute notification kinds ────────────────────────────────────
+    KIND_ISSUE_REPORTED      = 'issue_reported'      # buyer reported → notify seller
+    KIND_ISSUE_REPLIED       = 'issue_replied'       # seller replied → notify buyer
+    KIND_ISSUE_BUYER_REPLIED = 'issue_buyer_replied' # buyer replied → notify seller
+    KIND_ISSUE_RESOLVED      = 'issue_resolved'      # buyer confirmed → notify seller
+    KIND_ISSUE_ESCALATED     = 'issue_escalated'     # escalated to marketplace
+    KIND_MARKETPLACE_RELEASE = 'marketplace_release' # admin force-released → notify both
+    KIND_MARKETPLACE_REFUND  = 'marketplace_refund'  # admin force-refunded → notify both
 
     KIND_CHOICES = [
-        (KIND_ORDER_PLACED,      'Order Placed'),
-        (KIND_SHIPPED,           'Shipped'),
-        (KIND_RECEIPT_CONFIRMED, 'Receipt Confirmed'),
-        (KIND_FUNDS_RELEASED,    'Funds Released'),
-        (KIND_DISPUTE_OPENED,    'Dispute Opened'),
-        (KIND_REFUNDED,          'Refunded'),
+        (KIND_ORDER_PLACED,        'Order Placed'),
+        (KIND_SHIPPED,             'Shipped'),
+        (KIND_RECEIPT_CONFIRMED,   'Receipt Confirmed'),
+        (KIND_FUNDS_RELEASED,      'Funds Released'),
+        (KIND_DISPUTE_OPENED,      'Dispute Opened'),
+        (KIND_REFUNDED,            'Refunded'),
+        (KIND_ISSUE_REPORTED,      'Issue Reported'),
+        (KIND_ISSUE_REPLIED,       'Issue Replied'),
+        (KIND_ISSUE_BUYER_REPLIED, 'Issue Buyer Replied'),
+        (KIND_ISSUE_RESOLVED,      'Issue Resolved'),
+        (KIND_ISSUE_ESCALATED,     'Issue Escalated'),
+        (KIND_MARKETPLACE_RELEASE, 'Marketplace Released'),
+        (KIND_MARKETPLACE_REFUND,  'Marketplace Refunded'),
     ]
 
     recipient_user = models.ForeignKey(

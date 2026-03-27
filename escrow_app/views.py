@@ -588,16 +588,16 @@ class ReportIssueView(APIView):
             text=message,
         )
 
-        # Notify seller
+        # Notify seller — buyer has reported an issue
         buyer_lbl = tx.buyer_shop.shop_name if tx.buyer_shop else _safe_name(tx.buyer)
         notif_data = {
             'transaction': tx,
-            'kind':        Notification.KIND_DISPUTE_OPENED,
-            'title':       f'Issue reported: {tx.product_title}',
-            'message':     f'{buyer_lbl} reported an issue: "{issue_type}". Funds are frozen pending resolution.',
+            'kind':        Notification.KIND_ISSUE_REPORTED,
+            'title':       f'{buyer_lbl} reported an issue with "{tx.product_title}"',
+            'message':     f'Issue: "{issue_type}". Funds are frozen until the issue is resolved.',
         }
         if tx.seller_shop:
-            Notification.objects.create(recipient_shop=tx.seller_shop,  **notif_data)
+            Notification.objects.create(recipient_shop=tx.seller_shop, **notif_data)
         else:
             Notification.objects.create(recipient_user=tx.seller, **notif_data)
 
@@ -783,17 +783,26 @@ class IssueMessageView(APIView):
 
         # Notify the other party
         if is_seller:
-            notif_kwargs = {'transaction': tx, 'kind': 'issue_replied',
-                'title': f'Seller replied on: {tx.product_title}',
-                'message': text[:120]}
+            # Seller replied — notify buyer
+            seller_lbl = tx.seller_shop.shop_name if tx.seller_shop else _safe_name(tx.seller)
+            notif_kwargs = {
+                'transaction': tx, 'kind': Notification.KIND_ISSUE_REPLIED,
+                'title': f'{seller_lbl} replied to your issue with "{tx.product_title}"',
+                'message': text[:120],
+            }
             if tx.buyer_shop:
-                Notification.objects.create(recipient_shop=tx.buyer_shop,  **notif_kwargs)
+                Notification.objects.create(recipient_shop=tx.buyer_shop, **notif_kwargs)
             else:
                 Notification.objects.create(recipient_user=tx.buyer, **notif_kwargs)
         else:
-            notif_kwargs = {'transaction': tx, 'kind': 'issue_replied',
-                'title': f'Buyer replied on: {tx.product_title}',
-                'message': text[:120]}
+            # Buyer replied — notify seller using BUYER_REPLIED kind so
+            # serializer shows buyer as actor and routes to /support
+            buyer_lbl = tx.buyer_shop.shop_name if tx.buyer_shop else _safe_name(tx.buyer)
+            notif_kwargs = {
+                'transaction': tx, 'kind': Notification.KIND_ISSUE_BUYER_REPLIED,
+                'title': f'{buyer_lbl} replied to your response on "{tx.product_title}"',
+                'message': text[:120],
+            }
             if tx.seller_shop:
                 Notification.objects.create(recipient_shop=tx.seller_shop, **notif_kwargs)
             else:
@@ -844,9 +853,9 @@ class IssueResolveView(APIView):
             seller_lbl = tx.seller_shop.shop_name if tx.seller_shop else _safe_name(tx.seller)
             notif = {
                 'transaction': tx,
-                'kind':        'issue_replied',
+                'kind':        Notification.KIND_ISSUE_REPLIED,
                 'title':       f'{seller_lbl} marked the issue as resolved',
-                'message':     f'Please confirm if the issue with "{tx.product_title}" is resolved, or escalate to the marketplace.',
+                'message':     f'The seller believes the issue with "{tx.product_title}" is resolved. Please confirm to release funds, or escalate if not satisfied.',
             }
             if tx.buyer_shop:
                 Notification.objects.create(recipient_shop=tx.buyer_shop, **notif)
@@ -877,9 +886,9 @@ class IssueResolveView(APIView):
         buyer_lbl = _buyer_label(tx)
         notif = {
             'transaction': tx,
-            'kind':        Notification.KIND_RECEIPT_CONFIRMED,
-            'title':       f'Issue resolved — funds released',
-            'message':     f'{buyer_lbl} confirmed the issue is resolved for "{tx.product_title}". KES {tx.seller_payout} released.',
+            'kind':        Notification.KIND_ISSUE_RESOLVED,
+            'title':       f'Issue resolved — "{tx.product_title}"',
+            'message':     f'{buyer_lbl} confirmed the issue is resolved. KES {tx.seller_payout} has been released to your account.',
         }
         if tx.seller_shop:
             Notification.objects.create(recipient_shop=tx.seller_shop, **notif)
@@ -938,12 +947,25 @@ class IssueEscalateView(APIView):
 
         # Notify seller
         buyer_lbl = tx.buyer_shop.shop_name if tx.buyer_shop else _safe_name(tx.buyer)
-        notif_kwargs = {'transaction': tx, 'kind': Notification.KIND_DISPUTE_OPENED,
-            'title': f'Issue escalated: {tx.product_title}',
-            'message': f'{buyer_lbl} has escalated this issue to the marketplace. Funds remain frozen.'}
+        # Notify seller
+        notif_kwargs = {
+            'transaction': tx, 'kind': Notification.KIND_ISSUE_ESCALATED,
+            'title':   f'Issue escalated to Wireshops: "{tx.product_title}"',
+            'message': f'{buyer_lbl} escalated this issue to the marketplace. Our team will review and contact both parties within 24 hours. Funds remain frozen.',
+        }
         if tx.seller_shop:
             Notification.objects.create(recipient_shop=tx.seller_shop, **notif_kwargs)
         else:
             Notification.objects.create(recipient_user=tx.seller, **notif_kwargs)
+        # Notify buyer too — confirm escalation
+        buyer_conf = {
+            'transaction': tx, 'kind': Notification.KIND_ISSUE_ESCALATED,
+            'title':   f'Issue escalated: "{tx.product_title}"',
+            'message': 'The Wireshops marketplace team is now reviewing your dispute. We will contact both parties within 24 hours.',
+        }
+        if tx.buyer_shop:
+            Notification.objects.create(recipient_shop=tx.buyer_shop, **buyer_conf)
+        else:
+            Notification.objects.create(recipient_user=tx.buyer, **buyer_conf)
 
         return Response(IssueSerializer(issue, context={'request': request}).data)
