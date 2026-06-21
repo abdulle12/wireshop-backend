@@ -250,6 +250,29 @@ class PublicProductDetailView(APIView):
         return Response(PublicProductSerializer(product, context={'request': request}).data)
 
 
+
+class ShareProductView(APIView):
+    """
+    POST /api/products/<slug>/share/
+
+    Atomically increments share_count by 1.
+    No authentication required — anyone sharing increments the count,
+    exactly like TikTok/Instagram share counts.
+    Returns { share_count: <new_total> }
+    """
+    permission_classes = []   # public — no auth needed
+
+    def post(self, request, slug):
+        from django.db.models import F
+        updated = Product.objects.filter(slug=slug).update(
+            share_count=F('share_count') + 1
+        )
+        if not updated:
+            return Response({'detail': 'Product not found.'}, status=404)
+        share_count = Product.objects.filter(slug=slug).values_list('share_count', flat=True).first()
+        return Response({'share_count': share_count})
+
+
 class ShopFollowView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -792,4 +815,3 @@ class ProductReviewHelpfulView(APIView):
             'helpful':       helpful,
             'helpful_count': review.helpful_votes.count(),
         })
-    

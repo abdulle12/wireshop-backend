@@ -71,7 +71,8 @@ class Product(models.Model):
     price         = models.DecimalField(max_digits=10, decimal_places=2)
     stock         = models.PositiveIntegerField(default=0)
     delivery_time = models.CharField(max_length=100, blank=True)
-    buy_count     = models.PositiveIntegerField(default=0)          # ← new
+    buy_count     = models.PositiveIntegerField(default=0)
+    share_count   = models.PositiveIntegerField(default=0)
     attributes    = models.JSONField(default=list, blank=True)
     images        = models.JSONField(default=list, blank=True)
     slug          = models.SlugField(max_length=120, unique=True, blank=True, null=True)

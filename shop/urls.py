@@ -7,6 +7,7 @@ from .views import (
     PublicProductFeedView,
     PublicCategoryListView,
     PublicProductDetailView,
+    ShareProductView,
     PublicShopDetailView,
     PublicShopProductsView,
     ShopFollowView,
@@ -43,6 +44,7 @@ urlpatterns = [
 
     # ── Public product & shop detail ───────────────────────────────────────
     path('products/<slug:slug>/',                         PublicProductDetailView.as_view()),
+    path('products/<slug:slug>/share/',                   ShareProductView.as_view()),
     path('shops/public/<slug:slug>/',                     PublicShopDetailView.as_view()),
     path('shops/public/<slug:slug>/products/',            PublicShopProductsView.as_view()),
     path('shops/public/<slug:slug>/follow/',              ShopFollowView.as_view()),

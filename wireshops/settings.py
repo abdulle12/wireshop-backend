@@ -25,7 +25,13 @@ SECRET_KEY = 'django-insecure--5f0b0&ul($10fq)5eqarn1cl6j&vr967tox483ua70%5-)j&%
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    '10.38.16.80',
+    '192.168.119.1',   # ← add this
+    '192.168.52.1',    # ← add this
+    'localhost',
+    '127.0.0.1',
+]
 
 
 # Application definition
@@ -58,8 +64,11 @@ MIDDLEWARE = [
 ]
 INSTALLED_APPS += ['rest_framework_simplejwt.token_blacklist']
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",  # Vite
-    "http://localhost:3000",  # CRA
+    "http://localhost:5173",
+    "http://localhost:3000",
+    " http://10.38.16.80:5173",
+    "http://192.168.119.1:5173",   # ← add this
+    "http://192.168.52.1:5173",    # ← add this
 ]
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
@@ -151,3 +160,4 @@ import os
 
 MEDIA_URL  = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'

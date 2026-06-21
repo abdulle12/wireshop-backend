@@ -58,7 +58,8 @@ class PublicProductSerializer(serializers.ModelSerializer):
             'seller_id',
             'title', 'description',
             'price', 'stock', 'delivery_time',
-            'buy_count',          # ← new
+            'buy_count',
+            'share_count',
             'attributes', 'images',
             'category',
             'created_at',
